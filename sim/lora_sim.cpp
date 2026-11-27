@@ -119,6 +119,22 @@ const Line LIVE[2] = {
 };
 std::vector<Lora::Msgs::Msg> s_sent;   // what the compose line sent, oldest first
 
+// Private messages (Meshtastic DMs) with two of the nodes below: YETI is
+// toNode(0)'s number, NESSIE toNode(1)'s. State 2 is delivered, 3 failed.
+struct DmLine { uint32_t peer; int32_t at; bool mine; const char* who; const char* text; uint8_t state; };
+const DmLine DMS[] = {
+    { 0x3b1c9a00u,   -60000, false, "YETI",   "on my way. don't wander off",       0 },
+    { 0x3b1c9a00u,  -540000, true,  "YOU",    "yeah. bring the good flashlight",   2 },
+    { 0x3b1c9a00u,  -600000, false, "YETI",   "you still up on the ridge?",        0 },
+    { 0x3b1c9b11u, -3400000, true,  "YOU",    "is the lake trail flooded?",        3 },
+    { 0x3b1c9b11u, -3600000, false, "NESSIE", "swim or hike, your call",           0 },
+};
+// And one on MeshCore, with JERSEY DVL (its key's first four bytes).
+const DmLine MC_DMS[] = {
+    { 0x4e0a7f12u,  -240000, false, "JERSEY DVL", "tower repeater is back up",     0 },
+    { 0x4e0a7f12u,  -300000, true,  "YOU",        "is the fire tower one down?",   2 },
+};
+
 // Where the chats and the nodes count back from: the capture, or on a quiet
 // band the moment it went quiet -- a line is a packet, so none is newer.
 int64_t anchor() { return (int64_t)s_cfg.captureAt - (int64_t)s_cfg.quietSecs * 1000; }
@@ -149,7 +165,34 @@ std::vector<Lora::Msgs::Msg> msgsAt(uint32_t now) {
         const Line& l = LIVE[s_cfg.net ? 1 : 0];
         if ((int64_t)s_cfg.captureAt + l.at <= (int64_t)now) v.push_back(toMsg(l));
     }
-    for (const auto& m : s_sent) if (m.ms <= now) v.push_back(m);
+    for (const DmLine& d : DMS) {
+        const int64_t t = anchor() + d.at;
+        if (t < 1 || t > (int64_t)now) continue;
+        Lora::Msgs::Msg m{};
+        m.proto = Lora::Proto::MESHTASTIC; m.chan = Lora::Msgs::DM_CHAN; m.port = 1;
+        m.ms = (uint32_t)t; m.rssi = -84; m.snr4 = 18; m.direct = true;
+        m.peer = d.peer; m.mine = d.mine; m.dmState = d.state; m.senderId = d.mine ? 0 : d.peer;
+        snprintf(m.sender, sizeof m.sender, "%s", d.who);
+        snprintf(m.text, sizeof m.text, "%s", d.text);
+        v.push_back(m);
+    }
+    for (const DmLine& d : MC_DMS) {
+        const int64_t t = anchor() + d.at;
+        if (t < 1 || t > (int64_t)now) continue;
+        Lora::Msgs::Msg m{};
+        m.proto = Lora::Proto::MESHCORE; m.chan = Lora::Msgs::DM_CHAN; m.port = 2;
+        m.ms = (uint32_t)t; m.rssi = -79; m.snr4 = 24; m.direct = true;
+        m.peer = d.peer; m.mine = d.mine; m.dmState = d.state; m.senderId = 0;
+        snprintf(m.sender, sizeof m.sender, "%s", d.who);
+        snprintf(m.text, sizeof m.text, "%s", d.text);
+        v.push_back(m);
+    }
+    for (auto m : s_sent) {
+        if (m.ms > now) continue;
+        // A DM typed in the emulator: dots, then its tick three seconds later.
+        if (m.chan == Lora::Msgs::DM_CHAN) m.dmState = now - m.ms > 3000 ? 2 : 1;
+        v.push_back(m);
+    }
     std::stable_sort(v.begin(), v.end(), [](const Lora::Msgs::Msg& a, const Lora::Msgs::Msg& b) { return a.ms > b.ms; });
     return v;
 }
@@ -272,6 +315,7 @@ bool packetAt(uint16_t idxFromNewest, Packet& out) {
 }
 
 uint8_t nodeCount() { return NODE_N; }
+bool takeOperatorHit(OpAlert::Hit&) { return false; }
 
 uint8_t nodeSnapshot(Nodes::Node* out, uint8_t cap, uint8_t from) {
     Nodes::Node all[NODE_N];
@@ -307,10 +351,33 @@ bool sendText(Proto p, const char* name, const char* text, int8_t, int16_t chan)
     return true;
 }
 
+uint32_t sendDm(Proto p, uint32_t to, const char* text) {
+    if (!to || !text || !*text) return 0;
+    Msgs::Msg m{};
+    m.proto = p; m.chan = Msgs::DM_CHAN; m.port = p == Proto::MESHCORE ? 2 : 1;
+    m.ms = millis(); m.direct = true;
+    m.peer = to; m.mine = true; m.pktId = 0x5000u + (uint32_t)s_sent.size(); m.dmState = 1;
+    snprintf(m.sender, sizeof m.sender, "YOU");
+    snprintf(m.text, sizeof m.text, "%s", text);
+    s_sent.push_back(m);
+    return m.pktId;
+}
+uint8_t dmState(uint32_t) { return 2; }
+bool    dmHasKey(Proto, uint32_t) { return true; }
+void    nodeName(Proto p, uint32_t num, char* out, size_t cap) {
+    if (p == Proto::MESHCORE && num == 0x4e0a7f12u) { snprintf(out, cap, "JERSEY DVL"); return; }
+    for (uint8_t i = 0; i < NODE_N; i++)
+        if (NODES[i].proto == Proto::MESHTASTIC && 0x3b1c9a00u + i * 0x111u == num) { snprintf(out, cap, "%s", NODES[i].name); return; }
+    snprintf(out, cap, "!%08lx", (unsigned long)num);
+}
+
 }  // namespace Lora
 
-// LORA CHATS is not in the emulator; the page only asks it for the badge.
+// The one-shot renderer has no LORA CHATS screen; the page only asks it for
+// the badge. The browser's T-Deck build (-DSQUACH_LORA) has the real one.
+#if !SQUACH_LORA
 uint16_t uiLoraChatUnread() { return s_cfg.unread; }
+#endif
 
 // ---- what LORA SETTINGS calls ---------------------------------------------------------
 // The settings themselves are the real src/settings.cpp over the NVS shim;
@@ -393,3 +460,13 @@ void channelKeyPreview(uint8_t row, char* out, size_t cap) {
 }
 
 }  // namespace Lora
+
+#if SQUACH_LORA
+// The browser's T-Deck build calls the sniffer's start and per-loop tick, as
+// the board does. The band needs neither: it is a function of the clock, and
+// sim/main_wasm.cpp steps it every frame (SimLora::step).
+namespace Lora {
+bool begin() { return true; }
+void tick(uint32_t) {}
+}
+#endif

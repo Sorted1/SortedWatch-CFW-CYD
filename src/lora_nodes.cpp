@@ -92,14 +92,18 @@ uint16_t dutyPermille(const Node& n, uint32_t now) {
 
 bool dutyKnown(const Node& n, uint32_t now) { return now - n.hourStartMs > DUTY_MIN_WINDOW_MS; }
 
+static MeshtasticHook s_mtHook = nullptr;
+void setMeshtasticHook(MeshtasticHook fn) { s_mtHook = fn; }
+
 static void noteMeshtastic(const Packet& pk, uint32_t now) {
     Meshtastic::Decoded d;
     if (!Meshtastic::decode(pk, d)) return;
+    if (s_mtHook) s_mtHook(d, now);
     // Which key opened it, counted here and nowhere else: note() runs once per
     // frame off the air, while decode() runs again for every row the LIST and
     // CHANNELS views redraw. A counter inside the decoder would measure the
     // screen's refresh rate.
-    if (d.haveData) Meshtastic::noteChannelHeard(d.channelIdx, now);
+    if (d.haveData && !d.pki) Meshtastic::noteChannelHeard(d.channelIdx, now);
     Node& n = *get(Proto::MESHTASTIC, d.hdr.from, now);
     // A new row: the name learned before this boot, if any (Lora::Names),
     // and the node number until a NodeInfo says otherwise.
@@ -147,6 +151,13 @@ static void noteMeshtastic(const Packet& pk, uint32_t now) {
         // detection is a sensor trigger rather than a message.
         case Meshtastic::PORT_TEXT:
         case Meshtastic::PORT_ALERT:
+            // A direct message to us (Lora::Dm opened it): the conversation
+            // with its sender, not a channel's.
+            if (d.pki) {
+                Msgs::noteDm(d.hdr.from, false, d.hdr.id, 0, n.tag, d.text, pk, now, away == 0, away,
+                             Msgs::meshtasticKey(d.hdr.from, d.hdr.id));
+                break;
+            }
             Msgs::note(Proto::MESHTASTIC, d.channelIdx, (uint8_t)d.data.portnum, n.tag, d.hdr.from,
                        d.text, pk, now, away == 0, away, Msgs::meshtasticKey(d.hdr.from, d.hdr.id));
             break;
@@ -160,9 +171,13 @@ static void noteMeshtastic(const Packet& pk, uint32_t now) {
     }
 }
 
+static MeshCoreHook s_mcHook = nullptr;
+void setMeshCoreHook(MeshCoreHook fn) { s_mcHook = fn; }
+
 static void noteMeshCore(const Packet& pk, uint32_t now, uint32_t epoch) {
     MeshCore::Decoded d;
     if (!MeshCore::decode(pk, d)) return;
+    if (s_mcHook) s_mcHook(d, now);
     if (d.haveChannel) MeshCore::noteChannelHeard(d.channelIdx, now);   // opened, not necessarily text; see noteMeshtastic
     const MeshCore::Frame& f = d.f;
     // On a flood the path is the hops already TAKEN, so hops == 0 means we
@@ -222,9 +237,14 @@ static void noteMeshCore(const Packet& pk, uint32_t now, uint32_t epoch) {
     }
 }
 
+static LoRaWANHook s_wanHook = nullptr;
+void setLoRaWANHook(LoRaWANHook fn) { s_wanHook = fn; }
+
 static void noteLoRaWAN(const Packet& pk, uint32_t now) {
     LoRaWAN::Decoded d;
-    if (!LoRaWAN::decode(pk, d) || d.isBeacon) return;
+    if (!LoRaWAN::decode(pk, d)) return;
+    if (s_wanHook) s_wanHook(d, pk, now);
+    if (d.isBeacon) return;
     const LoRaWAN::Frame& f = d.f;
     if (f.mtype == LoRaWAN::JOIN_REQUEST) {
         uint64_t id = 0;

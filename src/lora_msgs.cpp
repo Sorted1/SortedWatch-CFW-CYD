@@ -102,10 +102,83 @@ void note(Proto p, uint8_t chan, uint8_t port, const char* sender, uint64_t send
     m.senderId = senderId;
     put(m.sender, sizeof m.sender, sender);
     put(m.text, sizeof m.text, text);
+    // A line break in a message (MeshCore lets you type one) was printed as a
+    // move to the start of the next row, spilling the rest of the message over
+    // the rows below. Control characters show as spaces, a CR as nothing. The
+    // dedupe key above was taken from the raw text, so a relay's copy still
+    // matches. (From PR #103 by shadowlab.)
+    {
+        char* w = m.text;
+        for (const char* r = m.text; *r; r++) {
+            const uint8_t c = (uint8_t)*r;
+            if (c == '\r') continue;
+            *w++ = (c < 0x20 || c == 0x7F) ? ' ' : (char)c;
+        }
+        *w = '\0';
+    }
+    for (char* s = m.sender; *s; s++) if ((uint8_t)*s < 0x20 || (uint8_t)*s == 0x7F) *s = ' ';
     s_st->head = (uint16_t)((s_st->head + 1) % CAP);
     if (s_st->held < CAP) s_st->held++;
     else                  s_st->dropped++;
     s_st->total++;
+}
+
+void noteDm(uint32_t peer, bool mine, uint32_t pktId, uint8_t dmState, const char* sender, const char* text,
+            const Packet& pk, uint32_t now, bool direct, uint8_t hops, uint32_t key, Proto p) {
+    if (!s_st || !peer) return;
+    const uint32_t before = s_st->total;
+    // The network's own type: Meshtastic's TEXT port, MeshCore's TXT_MSG.
+    note(p, DM_CHAN, p == Proto::MESHCORE ? 2 : 1, sender, mine ? 0 : peer, text, pk, now, direct, hops, key);
+    if (s_st->total == before) return;      // a copy, dropped
+    Msg& m = s_st->m[(s_st->head + CAP - 1) % CAP];
+    m.peer = peer;
+    m.mine = mine;
+    m.pktId = pktId;
+    m.dmState = dmState;
+}
+
+bool setDmState(uint32_t pktId, uint8_t dmState) {
+    if (!s_st || !pktId) return false;
+    for (uint16_t i = 0; i < s_st->held; i++) {
+        Msg& m = s_st->m[newest(i)];
+        if (m.chan == DM_CHAN && m.mine && m.pktId == pktId) { m.dmState = dmState; return true; }
+    }
+    return false;
+}
+
+uint16_t countForPeer(uint32_t peer) {
+    if (!s_st || !peer) return 0;
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < s_st->held; i++) {
+        const Msg& m = s_st->m[newest(i)];
+        if (m.chan == DM_CHAN && m.peer == peer) n++;
+    }
+    return n;
+}
+
+uint16_t pageForPeer(uint32_t peer, Msg* out, uint16_t cap, uint16_t from) {
+    if (!s_st || !out || !cap || !peer) return 0;
+    uint16_t seen = 0, w = 0;
+    for (uint16_t i = 0; i < s_st->held && w < cap; i++) {
+        const Msg& m = s_st->m[newest(i)];
+        if (m.chan != DM_CHAN || m.peer != peer) continue;
+        if (seen++ < from) continue;
+        out[w++] = m;
+    }
+    return w;
+}
+
+uint16_t dmPeers(uint32_t* out, uint16_t cap) {
+    if (!s_st || !out || !cap) return 0;
+    uint16_t w = 0;
+    for (uint16_t i = 0; i < s_st->held && w < cap; i++) {
+        const Msg& m = s_st->m[newest(i)];
+        if (m.chan != DM_CHAN || !m.peer) continue;
+        bool have = false;
+        for (uint16_t j = 0; j < w && !have; j++) have = out[j] == m.peer;
+        if (!have) out[w++] = m.peer;
+    }
+    return w;
 }
 
 uint16_t renameSender(Proto p, uint64_t senderId, const char* sender) {

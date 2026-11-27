@@ -59,6 +59,7 @@ int main() {
         ck("MediumFast hash 0x1F", channelHash("MediumFast", key, 16) == 0x1F);
         ck("ShortSlow hash 0x77",  channelHash("ShortSlow", key, 16) == 0x77);
         ck("NarrowSlow in ham mode 0x10", channelHash("NarrowSlow", nullptr, 0) == 0x10);
+        ck("NarrowFast hash 0x15", channelHash("NarrowFast", key, 16) == 0x15);
         ck("built-in channel 0 is LongFast on the default key", channel(0).hash == 0x08 && channel(0).keyLen == 16);
     }
 
@@ -251,9 +252,101 @@ int main() {
 
         ck("a 32-byte key added", addChannel("Big", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="));
         const Channel b = channel((uint8_t)findChannel("Big"));
-        ck("cannot be sent on (no AES-256 here)", b.keyLen == 32 && !canSend(b) &&
-           buildFrame(b, 1, 2, 3, PORT_TEXT, (const uint8_t*)msg, 5, f) == 0);
+        ck("can be sent on (AES-256)", b.keyLen == 32 && canSend(b));
+        {
+            const uint16_t bn = buildFrame(b, 1, 2, 3, PORT_TEXT, (const uint8_t*)msg, 5, f);
+            ck("sealed: the text is not in the clear", bn > 0 && !contains(f, bn, msg, 5));
+            memset(&pk, 0, sizeof pk); memcpy(pk.data, f, bn); pk.len = (uint8_t)bn;
+            ck("and it reads back on that channel", decode(pk, d) && d.haveData &&
+               d.channelIdx == findChannel("Big") && !strcmp(d.text, msg));
+        }
         clearUserChannels();
+    }
+
+    suite("A direct message, against a vector made by Python's cryptography");
+    {
+        // scratchpad pki_vectors.py, 2026-10-23: X25519, SHA-256, AES-256-CCM
+        // from an independent library, assembled the way CryptoEngine does.
+        uint8_t aPriv[32], aPub[32], bPriv[32], bPub[32], k1[32], k2[32], data[64], air[96], out[96];
+        LoraCrypto::fromHex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20", aPriv, 32);
+        LoraCrypto::fromHex("404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f", bPriv, 32);
+        LoraCrypto::x25519Base(aPub, aPriv);
+        LoraCrypto::x25519Base(bPub, bPriv);
+        char hex[80];
+        LoraCrypto::toHex(aPub, 32, hex);
+        ck("our public key", !strcmp(hex, "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c"));
+        ck("the same AES key from both ends", pkiKey(aPriv, bPub, k1) && pkiKey(bPriv, aPub, k2) && !memcmp(k1, k2, 32));
+        LoraCrypto::toHex(k1, 32, hex);
+        ck("and it is SHA-256 of the shared secret", !strcmp(hex, "b054d9e9f2b2ae3cf4e5abcd7110938362d67eee3e9d645794fb492c8d4437b7"));
+
+        const size_t dn = LoraCrypto::fromHex("080112146d656574206174207468652062696720726f636b", data, sizeof data);
+        const size_t an = LoraCrypto::fromHex("c6d5bb74c4446ea085f0a67f44af1ab5c3d23a0353a1e22073190ffb775333cf44332211", air, sizeof air);
+        ck("encodeData builds the same Data", encodeData(PORT_TEXT, (const uint8_t*)"meet at the big rock", 20, false, 0, out) == dn &&
+           !memcmp(out, data, dn));
+        ck("sealed: ciphertext, tag, extra nonce, byte for byte",
+           pkiSeal(k1, 0x5A5A1234u, 0x0BADF00Du, 0x11223344u, data, dn, out) == an && !memcmp(out, air, an));
+        ck("opened by the other end", pkiOpen(k2, 0x5A5A1234u, 0x0BADF00Du, air, an, out) == (int)dn && !memcmp(out, data, dn));
+        ck("the wrong sender in the nonce is refused", pkiOpen(k2, 0x5A5A1235u, 0x0BADF00Du, air, an, out) < 0);
+        uint8_t wrong[32]; memcpy(wrong, k2, 32); wrong[31] ^= 1;
+        ck("the wrong key is refused", pkiOpen(wrong, 0x5A5A1234u, 0x0BADF00Du, air, an, out) < 0);
+
+        uint8_t f[256];
+        const uint16_t n = buildPkiFrame(k1, 0x5A5A1234u, 0x27cc63ccu, 0x0BADF00Du, 3, true, 0x11223344u, data, dn, f);
+        ck("a DM frame: to one node, channel 0, want_ack, the vector's bytes after the header",
+           n == 16 + an && LoraCrypto::rd32le(f) == 0x27cc63ccu && f[13] == 0x00 && (f[12] & 0x08) && !memcmp(f + 16, air, an));
+        ck("never to everyone", buildPkiFrame(k1, 1, BROADCAST, 2, 3, true, 5, data, dn, f) == 0);
+
+        memset(&pk, 0, sizeof pk); memcpy(pk.data, f, n); pk.len = (uint8_t)n;
+        Decoded d;
+        ck("without an opener it stays shut", decode(pk, d) && !d.haveData && !d.pki);
+        static uint8_t s_key[32];
+        memcpy(s_key, k2, 32);
+        setPkiOpener([](const Header& h, const uint8_t* in, uint8_t len, uint8_t* o, uint8_t& olen) {
+            if (h.to != 0x27cc63ccu) return false;
+            const int m = pkiOpen(s_key, h.from, h.id, in, len, o);
+            if (m < 0) return false;
+            olen = (uint8_t)m;
+            return true;
+        });
+        ck("with one it opens as a direct message", decode(pk, d) && d.haveData && d.pki &&
+           d.channelIdx == PKI_CHANNEL && d.data.portnum == PORT_TEXT && !strcmp(d.text, "meet at the big rock"));
+        pk.data[30] ^= 0x01;
+        ck("a frame touched in the air does not", decode(pk, d) && !d.haveData);
+        setPkiOpener(nullptr);
+    }
+
+    suite("An ACK, the way a stock node sends one");
+    {
+        // Routing{error_reason: NONE} on the primary channel, to the sender,
+        // Data.request_id = the packet being acknowledged (MeshModule::allocAckNak).
+        uint8_t data[32], f[64];
+        const uint8_t routing[2] = { 0x18, 0x00 };
+        const size_t dn = encodeData(PORT_ROUTING, routing, 2, false, 0x0BADF00Du, data);
+        const uint16_t n = buildChannelFrame(channel(0), 0x5A5A1234u, 0x27cc63ccu, 99, 3, false, data, dn, f);
+        memset(&pk, 0, sizeof pk); memcpy(pk.data, f, n); pk.len = (uint8_t)n;
+        Decoded d;
+        ck("opens on LongFast as a routing reply to that packet",
+           decode(pk, d) && d.haveData && d.hdr.to == 0x27cc63ccu && d.data.portnum == PORT_ROUTING &&
+           d.data.requestId == 0x0BADF00Du && d.routing.errorReason == 0);
+        const size_t wn = encodeData(PORT_NODEINFO, routing, 2, true, 0, data);
+        ck("want_response travels in the Data", wn == dn - 5 + 2 && data[wn - 2] == 0x18 && data[wn - 1] == 0x01);
+    }
+
+    {   // A 32-byte channel key is AES-256-CTR with the same nonce. The vector is from an
+        // independent implementation (Python cryptography): key 00..1f, from 3b1c9a2e,
+        // id 1a2b3c4d, Data{portnum=1, payload="hello"}.
+        static const uint8_t CT[] = { 0x42, 0xaf, 0x61, 0xfe, 0x95, 0x54, 0x89, 0x6e, 0x0c };
+        Channel c; memset(&c, 0, sizeof c);
+        for (uint8_t i = 0; i < 32; i++) c.key[i] = i;
+        c.keyLen = 32; strcpy(c.name, "Fam256"); c.enabled = true;
+        Header h; memset(&h, 0, sizeof h); h.from = 0x3b1c9a2e; h.id = 0x1a2b3c4d;
+        uint8_t buf[sizeof CT]; memcpy(buf, CT, sizeof CT);
+        decrypt(h, c, buf, sizeof buf);
+        ck("AES-256 channel opens to the known plaintext", memcmp(buf, TEXT_DATA, sizeof TEXT_DATA) == 0);
+        decrypt(h, c, buf, sizeof buf);
+        ck("and seals back to the same ciphertext", memcmp(buf, CT, sizeof CT) == 0);
+        ck("a 32-byte channel can send", canSend(c));
+        ck("its hash covers all 32 key bytes", channelHash("Fam256", c.key, 32) == 0x7b);
     }
 
     return report();

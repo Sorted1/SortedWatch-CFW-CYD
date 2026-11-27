@@ -96,7 +96,18 @@ struct Msg {
     // 201 bytes: MeshCore's GroupText::text holds 160 and Meshtastic's text
     // 200, so nothing arrives truncated by this ring.
     char     text[201];
+    // A Meshtastic direct message (chan == DM_CHAN): the other node in the
+    // conversation, both ways -- the sender of one to us, the node one of
+    // ours went to. 0 on a channel message.
+    uint32_t peer;
+    // One we sent (sender "YOU"), its packet id, and how it is doing: a
+    // Lora::Dm::State, which the ACK moves on after the row is written.
+    bool     mine;
+    uint32_t pktId;
+    uint8_t  dmState;
 };
+// The chan of a direct message: no channel, the two nodes' own keys.
+static const uint8_t DM_CHAN = 0xFF;
 
 // Exactly what begin() wants, and the same contract as the survey's: until a
 // block is handed over, note() is a no-op and every read is empty.
@@ -123,6 +134,20 @@ void note(Proto p, uint8_t chan, uint8_t port, const char* sender, uint64_t send
 uint32_t meshtasticKey(uint32_t from, uint32_t packetId);
 uint32_t meshCoreKey(const char* sender, const char* text, uint32_t timestamp);
 static const uint32_t SEEN_MS = 10u * 60u * 1000u;
+
+// A direct message, to us or from us; the conversation is `peer`'s. The
+// same dedupe as note() by `key`.
+void noteDm(uint32_t peer, bool mine, uint32_t pktId, uint8_t dmState, const char* sender, const char* text,
+            const Packet& pk, uint32_t now, bool direct, uint8_t hops, uint32_t key,
+            Proto p = Proto::MESHTASTIC);
+// Our DM `pktId` has moved on (delivered, failed): its row's mark follows.
+// Returns whether a row was found.
+bool     setDmState(uint32_t pktId, uint8_t dmState);
+// One conversation, newest first, as pageFor.
+uint16_t countForPeer(uint32_t peer);
+uint16_t pageForPeer(uint32_t peer, Msg* out, uint16_t cap, uint16_t from = 0);
+// The nodes there are conversations with, the latest first, each once.
+uint16_t dmPeers(uint32_t* out, uint16_t cap);
 
 // A sender's name learned after its messages arrived (a Meshtastic NodeInfo
 // comes every few hours): every held message from that network and sender id
